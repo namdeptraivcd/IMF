@@ -1,4 +1,8 @@
 # Byte-compiled / optimized / DLL files
+# Local training data and generated runs
+/data/
+/logs/
+
 __pycache__/
 *.py[codz]
 *$py.class

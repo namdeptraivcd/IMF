@@ -1,0 +1,9 @@
+# Modal's GPU notebook image supplies a compatible CUDA torch/torchvision pair.
+accelerate>=0.27
+huggingface_hub>=0.21
+safetensors>=0.4
+pillow>=9
+tqdm>=4.65
+matplotlib>=3.7
+tensorboard>=2.14
+ipywidgets>=8
