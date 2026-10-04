@@ -122,7 +122,7 @@ cần merge vào main. GPU-resident profile hỗ trợ một GPU/process.
 
 ## Kiểm chứng implementation
 
-**38 unittest tests qua** trong môi trường local dưới đây.
+**39 unittest tests qua** trong môi trường local dưới đây.
 
 - Đếm bằng PyTorch: reference5.946.579, scaled22.002.655 trainable parameters.
 - Model22M chạy hai bước loss/backward/AdamW và sampling trên CPU; loss và

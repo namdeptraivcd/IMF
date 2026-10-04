@@ -22,6 +22,8 @@ class MultiTraceNotebookTests(unittest.TestCase):
             if cell.cell_type == "code":
                 ast.parse(cell.source)
                 self.assertFalse(cell.outputs)
+        self.assertIn("HF_PRIVATE = None", self.source("settings"))
+        self.assertIn("repo_private = hub_api.model_info(REPO_ID).private", self.source("preflight"))
 
     def test_pilot_does_not_evaluate_export_or_upload_partial_training(self):
         with tempfile.TemporaryDirectory() as folder:

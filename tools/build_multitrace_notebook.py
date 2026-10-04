@@ -57,7 +57,7 @@ def build():
         FID_NUM_GENERATED = 10_000
         FID_BATCH_SIZE = 128
         HF_REPO_ID = None  # or "username/multitrace-imf-cifar10-unet22m"
-        HF_PRIVATE = True
+        HF_PRIVATE = None  # None: giữ visibility repo hiện có; repo mới mặc định private
         AUTO_RESUME = True
         RESUME_CHECKPOINT = None
         """, "settings")
@@ -73,6 +73,10 @@ def build():
     preflight = next(c["source"] for c in notebook["cells"] if c["id"] == "preflight")
     preflight = preflight.replace("min(TRAIN_STEPS, BATCH_SIZE", "min(ACCUMULATION_STEPS, FID_NUM_GENERATED, FID_BATCH_SIZE, HF_CHECKPOINT_EVERY, BATCH_SIZE")
     preflight = preflight.replace("trace-imf-cifar10-22m", "multitrace-imf-cifar10-unet22m")
+    preflight = preflight.replace(
+        'print("Hub destination:", f"https://huggingface.co/{REPO_ID}", "private" if HF_PRIVATE else "public")',
+        'repo_private = hub_api.model_info(REPO_ID).private\n'
+        'print("Hub destination:", f"https://huggingface.co/{REPO_ID}", "private" if repo_private else "public")')
     preflight += '\nif STOP_AFTER_UPDATES is not None and STOP_AFTER_UPDATES <= 0:\n    raise ValueError("STOP_AFTER_UPDATES phải dương hoặc None")\n'
     preflight += '\nif HF_CHECKPOINT_EVERY % CHECKPOINT_EVERY:\n    raise ValueError("HF_CHECKPOINT_EVERY phải là bội số của CHECKPOINT_EVERY")\n'
     preflight += '\nif FID_NUM_GENERATED < 10 or FID_NUM_GENERATED % 10:\n    raise ValueError("FID_NUM_GENERATED phải chia hết cho 10 để cân bằng classes")\n'

@@ -214,6 +214,16 @@ class PipelineTests(unittest.TestCase):
                 prepare_repository("test-user/test-model", "test-token", private=True)
             api.create_repo.assert_not_called()
             self.assertIs(prepare_repository("test-user/test-model", "test-token", private=False), api)
+            self.assertIs(prepare_repository("test-user/test-model", "test-token", private=None), api)
+
+    def test_auto_visibility_creates_new_repositories_private(self):
+        from huggingface_hub.errors import RepositoryNotFoundError
+        with patch("huggingface_hub.HfApi") as factory:
+            api = factory.return_value
+            api.model_info.side_effect = RepositoryNotFoundError(
+                "missing", response=MagicMock(status_code=404))
+            self.assertIs(prepare_repository("test-user/new-model", "test-token", private=None), api)
+            self.assertTrue(api.create_repo.call_args.kwargs["private"])
 
 
 if __name__ == "__main__":

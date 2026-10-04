@@ -7,7 +7,12 @@ from pathlib import Path
 import torch
 
 
-def prepare_repository(repo_id, token, private=True):
+def prepare_repository(repo_id, token, private=None):
+    """Create a private repo by default, or preserve an existing repo's visibility.
+
+    Pass True/False to require an exact visibility. Pass None to accept the
+    visibility of an existing repository while keeping new repositories private.
+    """
     from huggingface_hub import HfApi
     from huggingface_hub.errors import RepositoryNotFoundError
     from huggingface_hub.utils import validate_repo_id
@@ -17,9 +22,10 @@ def prepare_repository(repo_id, token, private=True):
     try:
         info = api.model_info(repo_id)
     except RepositoryNotFoundError:
-        api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+        api.create_repo(repo_id=repo_id, repo_type="model",
+                        private=True if private is None else private, exist_ok=True)
     else:
-        if info.private != private:
+        if private is not None and info.private != private:
             raise ValueError("Existing repo visibility differs from HF_PRIVATE; set HF_PRIVATE to match")
     return api
 

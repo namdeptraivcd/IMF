@@ -90,8 +90,9 @@ Mặc định 200000 bước, batch 64, checkpoint mỗi 1000 bước và giữ 
 nhất. Đặt `TRAIN_STEPS=20` để thử luồng ngắn trước lượt train dài có tính phí GPU.
 
 `HF_REPO_ID=None` dùng `<tài-khoản-token>/trace-imf-cifar10-22m`; hoặc điền repo
-riêng. Repo mới mặc định private. Code giữ visibility của repo đã tồn tại; nếu
-khác `HF_PRIVATE`, sửa setting cho khớp. Không ghi token vào config hay artifact.
+riêng. Profile Multi-Trace dùng `HF_PRIVATE=None`: giữ nguyên visibility của repo
+đã tồn tại và tạo repo mới ở chế độ private. Đặt `True` hoặc `False` chỉ khi muốn
+kiểm tra visibility khớp chính xác. Không ghi token vào config hay artifact.
 Trong khi train, notebook backup full resume checkpoint tại pilot/final và mỗi
 10000 updates vào `training-checkpoints/<RUN_NAME>/` trên Hub; checkpoint cục bộ
 vẫn lưu mỗi 1000 updates và giữ ba bản gần nhất. Mỗi remote checkpoint chứa raw
