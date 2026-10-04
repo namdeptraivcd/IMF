@@ -77,8 +77,10 @@ def build():
         import sys
         import tempfile
 
-        if not VOLUME_ROOT.is_dir() or not VOLUME_ROOT.resolve().is_relative_to(Path("/mnt")):
-            raise RuntimeError("Attach Volume tại VOLUME_ROOT trước khi chạy")
+        # Modal exposes /mnt mounts as symlinks into /__modal/volumes.
+        # Validate the configured mount path without resolving that symlink.
+        if not VOLUME_ROOT.is_dir() or not Path(os.path.abspath(VOLUME_ROOT)).is_relative_to(Path("/mnt")):
+            raise RuntimeError(f"Attach Volume tại {VOLUME_ROOT} trước khi chạy")
         if not re.fullmatch(r"[A-Za-z0-9_-]+", RUN_NAME):
             raise ValueError("RUN_NAME chỉ dùng chữ, số, underscore và gạch ngang")
         RUN_DIR = VOLUME_ROOT / "runs" / RUN_NAME

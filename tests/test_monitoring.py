@@ -94,6 +94,8 @@ class MonitoringTests(unittest.TestCase):
             git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "fixture")
             original_commit = git("rev-parse", "HEAD")
             class MockMountedVolume:
+                def __fspath__(self):
+                    return "/mnt/test-volume"
                 def is_dir(self):
                     return True
                 def resolve(self):
