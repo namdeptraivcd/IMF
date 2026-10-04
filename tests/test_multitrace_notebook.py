@@ -23,7 +23,12 @@ class MultiTraceNotebookTests(unittest.TestCase):
                 ast.parse(cell.source)
                 self.assertFalse(cell.outputs)
         self.assertIn("HF_PRIVATE = None", self.source("settings"))
+        self.assertIn('RUN_NAME = "multitrace_unet15m_h200_b512_v1"', self.source("settings"))
+        self.assertIn("BATCH_SIZE = 512", self.source("settings"))
+        self.assertIn("ACCUMULATION_STEPS = 1", self.source("settings"))
         self.assertIn("repo_private = hub_api.model_info(REPO_ID).private", self.source("preflight"))
+        self.assertIn("configs.multitrace_cifar10_15m", self.source("runtime-config"))
+        self.assertIn('"--batch-size", str(BATCH_SIZE)', self.source("gpu-smoke"))
 
     def test_pilot_does_not_evaluate_export_or_upload_partial_training(self):
         with tempfile.TemporaryDirectory() as folder:

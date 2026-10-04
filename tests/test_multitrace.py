@@ -13,7 +13,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from configs.multitrace_cifar10_22m import config, scale_training_budget
+from configs.multitrace_cifar10_15m import config, scale_training_budget
+from configs.multitrace_cifar10_22m import config as config_22m
 from data import ResidentCIFARBatcher
 from ema import ModelEMA
 from hub import export_model
@@ -43,11 +44,15 @@ class MultiTraceTests(unittest.TestCase):
     def test_reference_and_scaled_parameter_counts(self):
         with torch.device("meta"):
             scaled = build_backbone(config)
+            scaled_22m = build_backbone(config_22m)
             original = copy.deepcopy(config)
             original["model"].update(base_channels=44, cond_dim=160)
             reference = build_backbone(original)
         self.assertEqual(sum(p.numel() for p in reference.parameters()), 5_946_579)
-        self.assertEqual(sum(p.numel() for p in scaled.parameters()), 22_002_655)
+        self.assertEqual(sum(p.numel() for p in scaled.parameters()), 14_992_182)
+        self.assertEqual(sum(p.numel() for p in scaled_22m.parameters()), 22_002_655)
+        self.assertEqual(config["batch_size"], 512)
+        self.assertEqual(config["gradient_accumulation_steps"], 1)
 
     def test_image_budget_and_ema_horizon_scale_with_effective_batch(self):
         base = scale_training_budget(128, 4)

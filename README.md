@@ -1,9 +1,10 @@
-# IMF - Trace-iMF, khoảng 22M tham số
+# IMF - Multi-Trace U-Net 15M trên Modal
 
 Profile mới tham chiếu notebook **U-Net Multi-Trace** của người dùng:
 [SCALING.md](SCALING.md) có bảng so sánh config và công thức scale theo image budget.
-Backbone **22.002.655 tham số**, base channels84, cond356; K=1..5, BF16, AdamW
-betas(0.9,0.99), clipping1.0, effective batch512 (micro128 × accumulation4),
+Backbone mặc định **14.992.182 tham số**, base channels69, cond312; K=1..5,
+BF16, AdamW betas(0.9,0.99), clipping1.0, effective batch512
+(micro512 × accumulation1 trên một H200),
 100k optimizer updates, warmup5k, EMA .9999. LR1e-4→1e-5 giữ theo bản tham chiếu.
 
 Notebook mới: [notebooks/multitrace_imf_modal.ipynb](notebooks/multitrace_imf_modal.ipynb).
@@ -16,13 +17,14 @@ notebook nguồn nên không so trực tiếp. Local tests không xác nhận CU
 thời gian hoàn tất hay chất lượng model trên Modal.
 
 ```bash
-python train.py --config configs/multitrace_cifar10_22m.py --check-model
-python train.py --config configs/multitrace_cifar10_22m.py --smoke-test
+python train.py --config configs/multitrace_cifar10_15m.py --check-model
+python train.py --config configs/multitrace_cifar10_15m.py --smoke-test
 python tools/build_multitrace_notebook.py
 ```
 
-Phần dưới mô tả baseline **DiT hai trace** cũ; profile U-Net mới dùng config,
-objective, EMA và sampling 1..5 NFE được mô tả trong SCALING.md.
+Profile U-Net 22M cũ vẫn nằm ở `configs/multitrace_cifar10_22m.py` để đối chiếu;
+checkpoint 22M không tương thích với profile 15M. Phần dưới mô tả baseline
+**DiT hai trace** cũ; config/workflow U-Net nằm trong SCALING.md.
 
 Triển khai PyTorch theo idea Trace-iMF của người dùng, kế thừa DiT và training
 flow từ `../backbone_IMF`. Đọc [REPO_PLAN.md](REPO_PLAN.md) để xem khảo sát repo,
@@ -216,6 +218,8 @@ hub.py                    # export safetensors + Hub upload và verify commit
 monitoring.py             # validation, gradients, charts, TensorBoard, live ETA
 sample.py                 # sampling từ inference bundle, không dùng pickle
 configs/cifar10_22m.py    # cấu hình model và train
+configs/multitrace_cifar10_15m.py  # U-Net Multi-Trace mặc định cho H200
+configs/multitrace_cifar10_22m.py  # profile U-Net 22M cũ để đối chiếu
 tests/test_trace_imf.py   # analytic JVP/semigradient, sampling, budget, backward
 tests/test_notebook_pipeline.py  # resume, export guards, Hub visibility/upload
 tests/test_monitoring.py  # gradient/update math, fixed validation, rollback, clone pin

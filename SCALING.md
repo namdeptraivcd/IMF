@@ -1,9 +1,10 @@
-# U-Net Multi-Trace 22M từ Untitled0.ipynb
+# U-Net Multi-Trace 15M từ Untitled0.ipynb
 
 Nguồn tham chiếu là notebook người dùng cung cấp, không phải config mặc định
-DiT của backbone_IMF. Profile mới nằm ở `configs/multitrace_cifar10_22m.py`;
+DiT của backbone_IMF. Profile chạy mặc định nằm ở `configs/multitrace_cifar10_15m.py`;
 workflow Modal là `notebooks/multitrace_imf_modal.ipynb`. Baseline DiT cũ vẫn dùng
-`configs/cifar10_22m.py`. Checkpoint của hai architecture không tương thích.
+`configs/cifar10_22m.py`; profile U-Net 22M trước đó được giữ tại
+`configs/multitrace_cifar10_22m.py`. Checkpoint 15M/22M/DiT không tương thích.
 
 Đây là **Multi-Trace mở rộng cho 1–5 NFE**, không phải objective chuyên one-step
 hai trace `r=0/r=t` trong mục10/14 của idea.pdf. K=1 vẫn có xác suất1/5 nên giữ
@@ -13,17 +14,17 @@ formulation ở `DIT_PROPOSAL_ALIGNMENT.md`; lựa chọn tiếp tục hiện t�
 
 ## So sánh cấu hình
 
-| Thành phần | Notebook tham chiếu | U-Net 22M mới | Lý do |
+| Thành phần | Notebook tham chiếu | U-Net 15M mặc định | Lý do |
 |---|---:|---:|---|
-| Trainable parameters | 5.946.579 | **22.002.655** | Đếm trực tiếp; +3,700 lần, lệch mục tiêu 0,0121% |
-| Base channels | 44 | 84 | Widen backbone, giữ bốn levels và skip topology |
-| Channels ở các levels | 44/88/88/176 | 84/168/168/336 | Multipliers vẫn (1,2,2,4) |
-| Condition dimension | 160 | 356 | Tăng khả năng biểu diễn conditioning và đạt budget |
+| Trainable parameters | 5.946.579 | **14.992.182** | Đếm trực tiếp; 2,52× reference, lệch mục tiêu 0,0521% |
+| Base channels | 44 | 69 | Widen backbone, giữ bốn levels và skip topology |
+| Channels ở các levels | 44/88/88/176 | 69/138/138/276 | Multipliers vẫn (1,2,2,4) |
+| Condition dimension | 160 | 312 | Tăng khả năng conditioning và đạt budget 15M |
 | Residual blocks/level | 1 | 1 | Decoder vẫn hai blocks/level |
 | Attention resolutions | 8 + middle 4 | 8 + middle 4 | Giữ attention math, hỗ trợ forward-mode JVP |
 | Fourier dimension / classes / image | 64 / 10 / 32×32 RGB | Giữ nguyên | Cùng dataset và conditioning |
-| Physical batch | 512 | 128 | Giảm activation memory cho backbone lớn |
-| Accumulation | 1 | 4 | Effective image batch vẫn **512** |
+| Physical batch | 512 | 512 | Dùng H200; GPU smoke kiểm tra đúng physical batch trước run |
+| Accumulation | 1 | 1 | Effective image batch vẫn **512** |
 | Optimizer updates | 100.000 | 100.000 | Cùng budget **51,2M ảnh** |
 | Warmup updates | 5.000 | 5.000 | Cùng warmup **2,56M ảnh** |
 | LR → minimum | 1e-4 → 1e-5 | Giữ nguyên | Không có quy tắc LR tuyến tính theo parameters |
@@ -40,12 +41,12 @@ formulation ở `DIT_PROPOSAL_ALIGNMENT.md`; lựa chọn tiếp tục hiện t�
 | FID batch | 512 | 128 | Batch chỉ ảnh hưởng memory/throughput của evaluation |
 
 Actual `total_steps` trong notebook là 100.000; comment nhắc 300.000 không phải
-giá trị được chạy. Mọi "step" của profile mới là một optimizer update; một step
-bao gồm bốn microbatch forward/backward. Forward có gradient gộp edge+diagonal
-thành 256 trace inputs khi micro-batch=128; effective image batch vẫn là 512.
+giá trị được chạy. Mọi "step" của profile mới là một optimizer update với một
+physical batch. Forward có gradient gộp edge+diagonal thành 1024 trace inputs
+khi image batch=512; effective image batch vẫn là 512.
 JVP không xây graph cho parameter gradient, tangent diagonal và kết quả được
-detach đúng semi-gradient. BF16 JVP trên CUDA cần GPU smoke test; local CPU test
-không xác nhận CUDA forward AD hay memory với microbatch128.
+detach đúng semi-gradient. Notebook chạy GPU smoke test bằng đúng batch512;
+local CPU test không xác nhận CUDA forward AD, tốc độ hoặc memory H200.
 
 ## Scale khi thay effective batch
 
@@ -76,7 +77,7 @@ hoặc cần đúng một hệ số bước học nào đó. Dataset vẫn CIFAR
 - Log mỗi 50 updates: mean loss/gradient/clip stats, loss và số quan sát theo K,
   LR thực tế, images_seen, image/s, ETA và CUDA memory. Heatmap tách encoder /
   decoder levels; update/weight đo optimizer update thật, không dùng LR×gradient.
-- Validation mỗi 1000: 640 test images ở defaults, cùng noise/quantiles qua các
+- Validation mỗi 1000: 2560 test images ở defaults, cùng noise/quantiles qua các
   lần đánh giá. Mỗi K có một dòng loss riêng; tổng loss là mean đều theo K.
   Raw và EMA validation đều được ghi để phân biệt EMA lag với loss plateau;
   EMA .9999 có thể làm đường validation phản ứng chậm ở đầu run.
@@ -124,8 +125,9 @@ cần merge vào main. GPU-resident profile hỗ trợ một GPU/process.
 
 **39 unittest tests qua** trong môi trường local dưới đây.
 
-- Đếm bằng PyTorch: reference5.946.579, scaled22.002.655 trainable parameters.
-- Model22M chạy hai bước loss/backward/AdamW và sampling trên CPU; loss và
+- Đếm bằng PyTorch: reference5.946.579, default15M=14.992.182 và
+  retained22M=22.002.655 trainable parameters.
+- Model15M chạy hai bước loss/backward/AdamW và sampling trên CPU; loss và
   mọi parameter gradients hữu hạn. Train FakeData với micro1×accum2 đến step2,
   resume đến step4: optimizer/scheduler/EMA update count4, strict EMA reload,
   JSONL đúng steps1..4 và validation0/2/4, không missing gradient tensors.
@@ -143,7 +145,7 @@ cần merge vào main. GPU-resident profile hỗ trợ một GPU/process.
   tests được mock; chưa upload model thật hoặc chạy trên tài khoản Modal/GPU.
 
 Môi trường local: PyTorch2.2.2, Accelerate1.15.0, pytorch-fid0.3.0 trong venv
-tạm `/private/tmp/imf-verify-env`. CUDA BF16/JVP, microbatch128 memory, tốc độ
+tạm `/private/tmp/imf-verify-env`. CUDA BF16/JVP, microbatch512 memory, tốc độ
 H200 và final model quality phải được đo ở run Modal thật.
 
 Nguồn API: [Accelerate gradient synchronization](https://huggingface.co/docs/accelerate/concept_guides/gradient_synchronization),

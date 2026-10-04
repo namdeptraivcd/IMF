@@ -1,4 +1,4 @@
-"""Derive the 22M Multi-Trace notebook from the shared Modal clone/resume workflow."""
+"""Derive the 15M Multi-Trace notebook from the shared Modal clone/resume workflow."""
 import json
 from build_modal_notebook import ROOT, cell, make_notebook
 
@@ -7,11 +7,12 @@ def build():
     notebook = make_notebook()
     replacements = {}
     replacements["intro"] = cell("markdown", """
-        # Multi-Trace U-Net 22M · Modal · resume / diagnostics / Hugging Face
+        # Multi-Trace U-Net 15M · Modal · resume / diagnostics / Hugging Face
 
         Tham chiếu `Untitled0.ipynb`: cùng U-Net, shared u head, K=1..5,
-        interval loss và EMA; tăng backbone **5.946.579 → 22.002.655 parameters**.
-        Base channels 44 → 84, condition dimension 160 → 356.
+        interval loss và EMA; scale backbone **5.946.579 → 14.992.182 parameters**.
+        Base channels 44 → 69, condition dimension 160 → 312. Profile 22M cũ
+        vẫn còn trong repo để đối chiếu nhưng checkpoint không tương thích.
 
         Đây là mở rộng Multi-Trace 1–5 NFE; objective one-step nguyên bản trong
         proposal chỉ train hai trace r=0/r=t. Config và lý do scale ở SCALING.md.
@@ -21,7 +22,8 @@ def build():
         attach Secret `HF_TOKEN` quyền write, thêm `GITHUB_TOKEN` nếu repo private.
         Không đặt token trực tiếp trong notebook.
 
-        Effective batch 512 = micro-batch 128 × accumulation 4. Giữ 100.000
+        Effective batch 512 = micro-batch 512 × accumulation 1 trên một H200.
+        GPU smoke test dùng đúng physical batch này trước khi tạo run. Giữ 100.000
         optimizer updates, warmup 5.000, LR 1e-4 → 1e-5, clipping 1.0, EMA .9999.
         Đổi effective batch thì số updates/warmup/EMA tự tính theo image budget
         51.2M/2.56M ảnh. LR và clipping không nhân theo số parameters.
@@ -40,9 +42,9 @@ def build():
         REPO_URL = "https://github.com/namdeptraivcd/IMF.git"
         REPO_REF = "codex/modal-training"
         VOLUME_ROOT = Path("/mnt/imf-training")
-        RUN_NAME = "multitrace_unet22m_hfcheckpoints_v1"
-        BATCH_SIZE = 128  # physical image microbatch; joint edge/diag forward uses 256 inputs
-        ACCUMULATION_STEPS = 4
+        RUN_NAME = "multitrace_unet15m_h200_b512_v1"
+        BATCH_SIZE = 512  # physical microbatch; joint edge/diag forward uses 1024 trace inputs
+        ACCUMULATION_STEPS = 1
         NUM_WORKERS = 2
         STOP_AFTER_UPDATES = 1_000  # None: train full image budget and auto upload
         LOG_EVERY = 50
@@ -56,7 +58,7 @@ def build():
         REFRESH_SECONDS = 10
         FID_NUM_GENERATED = 10_000
         FID_BATCH_SIZE = 128
-        HF_REPO_ID = None  # or "username/multitrace-imf-cifar10-unet22m"
+        HF_REPO_ID = None  # or "username/multitrace-imf-cifar10-unet15m"
         HF_PRIVATE = None  # None: giữ visibility repo hiện có; repo mới mặc định private
         AUTO_RESUME = True
         RESUME_CHECKPOINT = None
@@ -64,7 +66,8 @@ def build():
     # Shared clone logic includes the Modal symlink fix and pins the saved commit.
     clone = next(c["source"] for c in notebook["cells"] if c["id"] == "clone")
     clone = clone.replace("missing = [name", 'required += ["models/unet.py", "multi_trace_imf.py", "objectives.py", "ema.py",\n'
-        '             "evaluation.py", "configs/multitrace_cifar10_22m.py"]\nmissing = [name')
+        '             "evaluation.py", "configs/multitrace_cifar10_22m.py",\n'
+        '             "configs/multitrace_cifar10_15m.py"]\nmissing = [name')
     clone += '\nfor module_name in ("hub", "monitoring", "models", "objectives", "trace_imf", "multi_trace_imf"):\n'
     clone += '    loaded = sys.modules.get(module_name)\n    if loaded and getattr(loaded, "__file__", None):\n'
     clone += '        if not Path(loaded.__file__).resolve().is_relative_to(SOURCE_DIR.resolve()):\n'
@@ -72,7 +75,7 @@ def build():
     replacements["clone"] = cell("code", clone, "clone")
     preflight = next(c["source"] for c in notebook["cells"] if c["id"] == "preflight")
     preflight = preflight.replace("min(TRAIN_STEPS, BATCH_SIZE", "min(ACCUMULATION_STEPS, FID_NUM_GENERATED, FID_BATCH_SIZE, HF_CHECKPOINT_EVERY, BATCH_SIZE")
-    preflight = preflight.replace("trace-imf-cifar10-22m", "multitrace-imf-cifar10-unet22m")
+    preflight = preflight.replace("trace-imf-cifar10-22m", "multitrace-imf-cifar10-unet15m")
     preflight = preflight.replace(
         'print("Hub destination:", f"https://huggingface.co/{REPO_ID}", "private" if HF_PRIVATE else "public")',
         'repo_private = hub_api.model_info(REPO_ID).private\n'
@@ -84,7 +87,7 @@ def build():
     replacements["runtime-config"] = cell("code", """
         import copy
         import pprint
-        from configs.multitrace_cifar10_22m import config as base_config, scale_training_budget
+        from configs.multitrace_cifar10_15m import config as base_config, scale_training_budget
 
         cfg = copy.deepcopy(base_config)
         cfg.update(scale_training_budget(BATCH_SIZE, ACCUMULATION_STEPS))
@@ -118,8 +121,11 @@ def build():
         print("Run:", RUN_DIR)
         """, "runtime-config")
     smoke = next(c["source"] for c in notebook["cells"] if c["id"] == "gpu-smoke")
+    smoke = smoke.replace("Đúng model 22M", "Đúng model 15M")
+    smoke = smoke.replace('"--fake-data", "--steps", "3", "--batch-size", "2",',
+                          '"--fake-data", "--steps", "1", "--batch-size", str(BATCH_SIZE),')
     smoke = smoke.replace('print("GPU smoke passed")',
-        'print("GPU smoke passed at microbatch=2; training microbatch memory is measured in the pilot run")')
+        'print(f"GPU smoke passed at the configured physical batch={BATCH_SIZE}")')
     replacements["gpu-smoke"] = cell("code", smoke, "gpu-smoke")
     replacements["pipeline-note"] = cell("markdown", """
         ## Train → resume → FID → upload
@@ -127,14 +133,14 @@ def build():
         Resume khôi phục raw model, optimizer, scheduler, EMA, RNG và global update.
         GPU-resident CIFAR loader khôi phục permutation/cursor; CPU/FakeData loader
         bắt đầu shuffle mới. Logs sau checkpoint bị loại. Progress/ETA tính theo
-        optimizer update, gồm 4 microbatches; EMA và LR chỉ update một lần.
+        optimizer update, gồm 1 physical batch 512; EMA và LR update một lần.
 
         Khi thử 1000 updates xong, xem runtime/ETA và clip_fraction. Đặt
         `STOP_AFTER_UPDATES=None`, chạy lại settings và pipeline để tiếp tục;
         không cần đổi config hoặc RUN_NAME. Nếu restart kernel, Run all.
         Thay đổi architecture/effective batch/image budget cần RUN_NAME mới.
         Không chạy hai kernel vào cùng run. Interrupt có thể mất các update sau
-        checkpoint gần nhất. Nếu OOM, dùng RUN_NAME mới và batch64 × accumulation8.
+        checkpoint gần nhất. Nếu OOM, dùng RUN_NAME mới và batch256 × accumulation2.
 
         Checkpoint đầy đủ vẫn lưu vào Volume mỗi 1.000 updates. Bản resume gồm raw
         model, EMA, optimizer, scheduler, scaler, RNG và data cursor được upload vào
