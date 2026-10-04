@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import runpy
@@ -11,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from configs.cifar10_22m import config
-from hub import export_model, prepare_repository, upload_model
+from hub import export_model, prepare_repository, upload_model, upload_training_checkpoint
 from models.dit import TraceDiT
 from train import run_training
 
@@ -97,6 +98,50 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "n_steps"):
                 run_training(TraceDiT(**self.cfg["model"]), self.count, incompatible_cfg, args)
 
+    def test_trainer_uploads_pilot_and_final_resume_checkpoints(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run_dir = Path(folder) / "hub-run"
+            cfg = copy.deepcopy(self.cfg)
+            cfg.update(n_steps=2, sample_step=2, checkpoint_step=1,
+                       monitoring={"enabled": False})
+            args = SimpleNamespace(fake_data=True, output_dir=folder, run_suffix="hub",
+                run_dir=str(run_dir), resume=None, stop_after=1,
+                hub_checkpoint_repo="test-user/test-model", hub_checkpoint_every=2)
+            receipt = {"repo_id": "test-user/test-model", "run_name": "hub-run",
+                       "checkpoint": "fixture", "step": 0, "revision": "abc",
+                       "path_in_repo": "fixture", "url": "https://huggingface.co/checkpoint"}
+            with patch.dict(os.environ, {"HF_TOKEN": "test-token"}), \
+                 patch("huggingface_hub.HfApi"), \
+                 patch("hub.upload_training_checkpoint", return_value=receipt.copy()) as upload:
+                run_training(self.model, self.count, cfg, args)
+                args.resume = str(run_dir / "ckpts/step_0000001.pt")
+                args.stop_after = None
+                run_training(TraceDiT(**cfg["model"]), self.count, cfg, args)
+            self.assertEqual([call.args[2].name for call in upload.call_args_list],
+                             ["step_0000001.pt", "step_0000002.pt"])
+            events = [json.loads(line) for line in
+                      (run_dir / "hub_checkpoints.jsonl").read_text().splitlines()]
+            self.assertEqual([event["status"] for event in events], ["uploaded", "uploaded"])
+
+    def test_hub_failure_is_logged_without_losing_local_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run_dir = Path(folder) / "failed-upload"
+            cfg = copy.deepcopy(self.cfg)
+            cfg.update(n_steps=1, sample_step=1, checkpoint_step=1,
+                       monitoring={"enabled": False})
+            args = SimpleNamespace(fake_data=True, output_dir=folder, run_suffix="hub-failure",
+                run_dir=str(run_dir), resume=None, stop_after=None,
+                hub_checkpoint_repo="test-user/test-model", hub_checkpoint_every=1)
+            with patch.dict(os.environ, {"HF_TOKEN": "test-token"}), \
+                 patch("huggingface_hub.HfApi"), patch("train.time.sleep"), \
+                 patch("hub.upload_training_checkpoint", side_effect=OSError("network down")) as upload:
+                run_training(self.model, self.count, cfg, args)
+            self.assertTrue((run_dir / "ckpts/step_0000001.pt").is_file())
+            self.assertEqual(upload.call_count, 3)
+            event = json.loads((run_dir / "hub_checkpoints.jsonl").read_text())
+            self.assertEqual(event["status"], "failed")
+            self.assertEqual(event["attempts"], 3)
+
     def test_export_safetensors_complete_run_only_and_sample_source(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -141,6 +186,25 @@ class PipelineTests(unittest.TestCase):
         api.list_repo_files.return_value = ["config.json"]
         with self.assertRaisesRegex(RuntimeError, "missing required"):
             upload_model(api, "test-user/test-model", "/tmp/export")
+
+    def test_training_checkpoint_upload_uses_versioned_path_and_verifies_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            checkpoint = Path(folder) / "step_0001000.pt"
+            checkpoint.write_bytes(b"full resume state")
+            api = MagicMock()
+            api.upload_file.return_value.oid = "checkpoint-commit"
+            remote_path = "training-checkpoints/run-v1/step_0001000.pt"
+            api.list_repo_files.return_value = [remote_path]
+            receipt = upload_training_checkpoint(
+                api, "test-user/test-model", checkpoint, "run-v1")
+            self.assertEqual(receipt["step"], 1000)
+            self.assertEqual(receipt["path_in_repo"], remote_path)
+            self.assertIn("checkpoint-commit", receipt["url"])
+            self.assertEqual(api.upload_file.call_args.kwargs["path_in_repo"], remote_path)
+            self.assertEqual(api.list_repo_files.call_args.kwargs["revision"], "checkpoint-commit")
+            api.list_repo_files.return_value = []
+            with self.assertRaisesRegex(RuntimeError, "missing uploaded checkpoint"):
+                upload_training_checkpoint(api, "test-user/test-model", checkpoint, "run-v1")
 
     def test_repo_visibility_is_preserved(self):
         with patch("huggingface_hub.HfApi") as factory:

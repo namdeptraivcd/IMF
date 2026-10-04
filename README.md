@@ -10,7 +10,8 @@ Notebook mới: [notebooks/multitrace_imf_modal.ipynb](notebooks/multitrace_imf_
 Clone nhánh `codex/modal-training`; cần RUN_NAME mới, Volume và HF_TOKEN Secret.
 Mặc định pilot1000 updates có resume/ETA/gradient/raw+EMA validation; đổi
 `STOP_AFTER_UPDATES=None` để train hết schedule rồi chạy FID1..5 NFE và upload
-final EMA model lên Hugging Face. FID dùng pytorch-fid, khác protocol FID trong
+final EMA model lên Hugging Face. Full resume checkpoint được backup lên cùng
+Hub repo tại pilot/final và mỗi 10000 updates. FID dùng pytorch-fid, khác protocol FID trong
 notebook nguồn nên không so trực tiếp. Local tests không xác nhận CUDA memory,
 thời gian hoàn tất hay chất lượng model trên Modal.
 
@@ -91,9 +92,14 @@ nhất. Đặt `TRAIN_STEPS=20` để thử luồng ngắn trước lượt trai
 `HF_REPO_ID=None` dùng `<tài-khoản-token>/trace-imf-cifar10-22m`; hoặc điền repo
 riêng. Repo mới mặc định private. Code giữ visibility của repo đã tồn tại; nếu
 khác `HF_PRIVATE`, sửa setting cho khớp. Không ghi token vào config hay artifact.
+Trong khi train, notebook backup full resume checkpoint tại pilot/final và mỗi
+10000 updates vào `training-checkpoints/<RUN_NAME>/` trên Hub; checkpoint cục bộ
+vẫn lưu mỗi 1000 updates và giữ ba bản gần nhất. Mỗi remote checkpoint chứa raw
+model, EMA, optimizer, scheduler, scaler, RNG và data cursor. Upload retry ba lần;
+lỗi Hub được ghi vào `hub_checkpoints.jsonl` nhưng không dừng GPU training.
 Khi train xong, notebook export `model.safetensors`, architecture config, source
 sampling, model card, log, ảnh, đồ thị, TensorBoard events và best validation
-weights khi có; checkpoint optimizer/scaler ở lại Modal Volume.
+weights khi có.
 Upload thất bại có thể chạy lại cell pipeline để thử lại mà không train lại.
 
 Hướng dẫn nền tảng: [Modal Notebook setup](https://modal.com/docs/guide/notebooks),

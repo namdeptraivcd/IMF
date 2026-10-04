@@ -87,12 +87,16 @@ hoặc cần đúng một hệ số bước học nào đó. Dataset vẫn CIFAR
 - Resume phục hồi raw model, optimizer/scheduler/scaler, EMA/update count,
   RNG và GPU resident batcher permutation/cursor. CPU DataLoader shuffle mới.
   Checkpoint ở ranh giới optimizer update; không checkpoint giữa microbatches.
+- Modal lưu checkpoint cục bộ mỗi 1000 updates và backup full resume checkpoint
+  lên `training-checkpoints/<RUN_NAME>/` trong Hugging Face repo mỗi 10000 updates.
+  Điểm dừng pilot và final luôn được upload. Upload lỗi retry ba lần, ghi
+  `hub_checkpoints.jsonl` và không làm dừng training; checkpoint Volume vẫn còn.
 - Final FID dùng EMA và ghi protocol, sample counts, weights SHA256, seed, batch,
   từng NFE; cache real stats trên Volume. Fixed noise/labels dùng lại giữa NFE.
   FID10k có sampling variance và không tương đương FID50k. Không có metric
   chất lượng thực tế nào được đo trong workspace này.
-- HF inference bundle mặc định chứa final EMA `model.safetensors`; raw optimizer
-  checkpoint ở Volume. `sample.py --nfe 1..5` dùng đúng reverse equal grid;
+- HF inference bundle mặc định chứa final EMA `model.safetensors`; full optimizer
+  checkpoint được upload riêng khỏi inference bundle. `sample.py --nfe 1..5` dùng đúng reverse equal grid;
   `best_validation.safetensors` là EMA snapshot được chọn theo validation loss.
 
 ## Chạy trên Modal
@@ -108,7 +112,8 @@ Default `STOP_AFTER_UPDATES=1000` chạy pilot có checkpoint với **full 100k 
 schedule**, không nén warmup. Đọc throughput/ETA sau pilot; để train hết, đổi
 `STOP_AFTER_UPDATES=None`, chạy settings + pipeline lần nữa. Sau restart kernel,
 Run all với cùng RUN_NAME/config; notebook tự pin source commit cũ. Pilot chưa
-được xuất thành final model hoặc upload. Không suy ra 100k updates có đủ $30
+được xuất thành final model, nhưng checkpoint resume pilot được backup lên Hub.
+Không suy ra 100k updates có đủ $30
 credit từ tên GPU; FID và CPU/RAM cũng tốn thời gian/chi phí.
 
 Khi đã hoàn tất train, chạy pipeline lại để retry FID/upload mà không train lại.
@@ -117,7 +122,7 @@ cần merge vào main. GPU-resident profile hỗ trợ một GPU/process.
 
 ## Kiểm chứng implementation
 
-**35 unittest tests qua** trong môi trường local dưới đây.
+**38 unittest tests qua** trong môi trường local dưới đây.
 
 - Đếm bằng PyTorch: reference5.946.579, scaled22.002.655 trainable parameters.
 - Model22M chạy hai bước loss/backward/AdamW và sampling trên CPU; loss và

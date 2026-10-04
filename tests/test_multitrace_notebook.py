@@ -29,6 +29,7 @@ class MultiTraceNotebookTests(unittest.TestCase):
             run = root / "run"
             state = dict(Path=Path, json=json, RUN_DIR=run, TRAIN_STEPS=100_000,
                 cfg={}, RESUME_CHECKPOINT=None, AUTO_RESUME=True, STOP_AFTER_UPDATES=1000,
+                HF_CHECKPOINT_EVERY=10_000,
                 CONFIG_PATH=root / "config.py", SOURCE_DIR=root, child_env={},
                 REFRESH_SECONDS=10, VOLUME_ROOT=root, RUN_NAME="pilot", REPO_ID="test/model",
                 hub_api=object(), GIT_COMMIT="fixture")
@@ -40,6 +41,8 @@ class MultiTraceNotebookTests(unittest.TestCase):
                 exec(compile(self.source("train-and-upload"), "pipeline", "exec"), state)
                 command = train.call_args.args[0]
                 self.assertEqual(command[command.index("--stop-after") + 1], "1000")
+                self.assertEqual(command[command.index("--hub-checkpoint-every") + 1], "10000")
+                self.assertEqual(command[command.index("--hub-checkpoint-repo") + 1], "test/model")
                 evaluation.assert_not_called()
                 export.assert_not_called()
                 upload.assert_not_called()
@@ -57,17 +60,22 @@ class MultiTraceNotebookTests(unittest.TestCase):
             state = dict(Path=Path, json=json, sys=sys, subprocess=subprocess,
                 RUN_DIR=run, TRAIN_STEPS=100_000, cfg={}, RESUME_CHECKPOINT=None,
                 AUTO_RESUME=True, STOP_AFTER_UPDATES=None, CONFIG_PATH=root / "config.py",
+                HF_CHECKPOINT_EVERY=10_000,
                 SOURCE_DIR=root, child_env={}, REFRESH_SECONDS=10, VOLUME_ROOT=root,
                 RUN_NAME="complete", REPO_ID="test/model", hub_api=object(), GIT_COMMIT="fixture")
             events = []
             with patch("monitoring.run_with_dashboard") as train, \
                  patch("subprocess.run", side_effect=lambda *a, **kw: events.append("evaluate")), \
                  patch("hub.export_model", side_effect=lambda *a, **kw: events.append("export")), \
+                 patch("hub.upload_training_checkpoint", side_effect=lambda *a, **kw: events.append("checkpoint") or {
+                     "checkpoint": "step_0100000.pt", "url": "https://huggingface.co/test/checkpoint"}), \
                  patch("hub.upload_model", side_effect=lambda *a, **kw: events.append("upload") or "https://huggingface.co/test/model"):
                 exec(compile(self.source("train-and-upload"), "pipeline", "exec"), state)
                 train.assert_not_called()
-                self.assertEqual(events, ["evaluate", "export", "upload"])
+                self.assertEqual(events, ["checkpoint", "evaluate", "export", "upload"])
                 self.assertTrue((run / "hub_upload.json").is_file())
+                checkpoint_event = json.loads((run / "hub_checkpoints.jsonl").read_text())
+                self.assertEqual(checkpoint_event["status"], "uploaded")
 
     def test_modal_volume_symlink_is_accepted_in_the_new_notebook(self):
         code = self.source("clone")

@@ -81,6 +81,20 @@ def run_training(model, count, cfg, args):
         model = model.to(memory_format=torch.channels_last)
     accelerator = Accelerator(cpu=not torch.cuda.is_available(), mixed_precision=precision, kwargs_handlers=[
         DistributedDataParallelKwargs(find_unused_parameters=False)])
+    hub_checkpoint_repo = getattr(args, "hub_checkpoint_repo", None)
+    hub_checkpoint_every = getattr(args, "hub_checkpoint_every", None)
+    hub_checkpoint_api = None
+    if hub_checkpoint_repo:
+        hub_checkpoint_every = hub_checkpoint_every or cfg["checkpoint_step"]
+        if hub_checkpoint_every <= 0 or hub_checkpoint_every % cfg["checkpoint_step"]:
+            raise ValueError("Hub checkpoint interval must be a positive multiple of checkpoint_step")
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            raise RuntimeError("HF_TOKEN is required when Hub checkpoint backup is enabled")
+        if accelerator.is_main_process:
+            from huggingface_hub import HfApi
+            hub_checkpoint_api = HfApi(token=token)
+        del token
     resume_path = getattr(args, "resume", None)
     checkpoint = None
     start_step = 0
@@ -398,6 +412,36 @@ def run_training(model, count, cfg, args):
                 if keep is not None and keep > 0:
                     for old_path in sorted((run_dir / "ckpts").glob("step_*.pt"))[:-keep]:
                         old_path.unlink()
+                upload_due = hub_checkpoint_repo and (
+                    step % hub_checkpoint_every == 0 or step == stop_step or step == cfg["n_steps"])
+                if upload_due:
+                    from hub import upload_training_checkpoint
+                    save_progress(step, "uploading checkpoint to Hugging Face")
+                    failure = None
+                    for attempt in range(1, 4):
+                        try:
+                            receipt = upload_training_checkpoint(
+                                hub_checkpoint_api, hub_checkpoint_repo, checkpoint_path, run_dir.name)
+                        except Exception as error:  # preserve training through transient Hub/network failures
+                            failure = error
+                            if attempt < 3:
+                                time.sleep(2 ** attempt)
+                        else:
+                            receipt.update(status="uploaded", attempts=attempt)
+                            with (run_dir / "hub_checkpoints.jsonl").open("a") as stream:
+                                stream.write(json.dumps(receipt) + "\n")
+                            accelerator.print(f"Hub checkpoint verified: {receipt['url']}")
+                            failure = None
+                            break
+                    if failure is not None:
+                        event = {"status": "failed", "step": step, "checkpoint": checkpoint_path.name,
+                                 "repo_id": hub_checkpoint_repo, "attempts": 3,
+                                 "error_type": type(failure).__name__, "error": str(failure)}
+                        with (run_dir / "hub_checkpoints.jsonl").open("a") as stream:
+                            stream.write(json.dumps(event) + "\n")
+                        accelerator.print(
+                            f"WARNING: Hub checkpoint upload failed after 3 attempts; "
+                            f"training continues and local checkpoint remains at {checkpoint_path}")
             accelerator.wait_for_everyone()
         if log_now or validation_now or step == stop_step:
             phase = "complete" if step == cfg["n_steps"] else "paused" if step == stop_step else "training"
@@ -423,6 +467,9 @@ def main():
     parser.add_argument("--run-dir", help="Exact persistent directory for this run")
     parser.add_argument("--resume", help="Local trusted trainer checkpoint to restore")
     parser.add_argument("--stop-after", type=int, help="Stop at this global step, preserving the full LR schedule")
+    parser.add_argument("--hub-checkpoint-repo", help="Hugging Face model repo for full resume checkpoints")
+    parser.add_argument("--hub-checkpoint-every", type=int,
+                        help="Upload every N optimizer updates; must be a checkpoint interval multiple")
     args = parser.parse_args()
     cfg = load_config(args.config)
     for arg, key in ((args.steps, "n_steps"), (args.batch_size, "batch_size"),

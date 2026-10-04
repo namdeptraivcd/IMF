@@ -40,7 +40,7 @@ def build():
         REPO_URL = "https://github.com/namdeptraivcd/IMF.git"
         REPO_REF = "codex/modal-training"
         VOLUME_ROOT = Path("/mnt/imf-training")
-        RUN_NAME = "multitrace_unet22m_v1"
+        RUN_NAME = "multitrace_unet22m_hfcheckpoints_v1"
         BATCH_SIZE = 128  # physical image microbatch; joint edge/diag forward uses 256 inputs
         ACCUMULATION_STEPS = 4
         NUM_WORKERS = 2
@@ -52,6 +52,7 @@ def build():
         SAMPLE_EVERY = 1_000
         CHECKPOINT_EVERY = 1_000
         KEEP_LAST_CHECKPOINTS = 3
+        HF_CHECKPOINT_EVERY = 10_000  # pilot/final are also uploaded even off-cycle
         REFRESH_SECONDS = 10
         FID_NUM_GENERATED = 10_000
         FID_BATCH_SIZE = 128
@@ -70,9 +71,10 @@ def build():
     clone += '            raise RuntimeError("Restart kernel trước khi đổi notebook/repo source để xóa module cache")\n'
     replacements["clone"] = cell("code", clone, "clone")
     preflight = next(c["source"] for c in notebook["cells"] if c["id"] == "preflight")
-    preflight = preflight.replace("min(TRAIN_STEPS, BATCH_SIZE", "min(ACCUMULATION_STEPS, FID_NUM_GENERATED, FID_BATCH_SIZE, BATCH_SIZE")
+    preflight = preflight.replace("min(TRAIN_STEPS, BATCH_SIZE", "min(ACCUMULATION_STEPS, FID_NUM_GENERATED, FID_BATCH_SIZE, HF_CHECKPOINT_EVERY, BATCH_SIZE")
     preflight = preflight.replace("trace-imf-cifar10-22m", "multitrace-imf-cifar10-unet22m")
     preflight += '\nif STOP_AFTER_UPDATES is not None and STOP_AFTER_UPDATES <= 0:\n    raise ValueError("STOP_AFTER_UPDATES phải dương hoặc None")\n'
+    preflight += '\nif HF_CHECKPOINT_EVERY % CHECKPOINT_EVERY:\n    raise ValueError("HF_CHECKPOINT_EVERY phải là bội số của CHECKPOINT_EVERY")\n'
     preflight += '\nif FID_NUM_GENERATED < 10 or FID_NUM_GENERATED % 10:\n    raise ValueError("FID_NUM_GENERATED phải chia hết cho 10 để cân bằng classes")\n'
     replacements["preflight"] = cell("code", preflight, "preflight")
     replacements["runtime-config"] = cell("code", """
@@ -130,19 +132,50 @@ def build():
         Không chạy hai kernel vào cùng run. Interrupt có thể mất các update sau
         checkpoint gần nhất. Nếu OOM, dùng RUN_NAME mới và batch64 × accumulation8.
 
+        Checkpoint đầy đủ vẫn lưu vào Volume mỗi 1.000 updates. Bản resume gồm raw
+        model, EMA, optimizer, scheduler, scaler, RNG và data cursor được upload vào
+        `training-checkpoints/<RUN_NAME>/` trên cùng Hugging Face model repo mỗi
+        10.000 updates; checkpoint pilot và final luôn được upload. Upload retry ba
+        lần; nếu Hub/network lỗi thì training tiếp tục và ghi trạng thái vào
+        `hub_checkpoints.jsonl`. Các file này lớn nên không nên đặt interval 1.000.
+
         FID dùng **pytorch-fid 0.3.0**, 50k CIFAR train images không augmentation,
         mặc định 10k generated/class-balanced cho mỗi NFE1..5, cùng noise/labels.
         Đây là FID10k, không phải FID50k và không so trực tiếp với FID trong notebook
         tham chiếu (ImageNet Inception weights khác). Eval có progress/ETA riêng,
         mất thêm GPU time; real stats được cache, kết quả từng NFE được lưu để retry.
         Nếu upload lỗi, chạy lại pipeline: bỏ qua train và phần FID đã xong.
-        Chỉ upload khi đã đủ training updates và FID hoàn tất.
+        Inference bundle chỉ được upload khi đủ training updates và FID hoàn tất.
         """, "pipeline-note")
     pipeline = next(c["source"] for c in notebook["cells"] if c["id"] == "train-and-upload")
     pipeline = pipeline.replace('if selected_resume:\n',
         'if STOP_AFTER_UPDATES is not None:\n        command += ["--stop-after", str(STOP_AFTER_UPDATES)]\n    if selected_resume:\n')
+    pipeline = pipeline.replace('if STOP_AFTER_UPDATES is not None:\n',
+        'command += ["--hub-checkpoint-repo", REPO_ID, "--hub-checkpoint-every", str(HF_CHECKPOINT_EVERY)]\n    if STOP_AFTER_UPDATES is not None:\n', 1)
     pipeline = pipeline[:pipeline.index('EXPORT_DIR =')]
-    pipeline += '''MODEL_URL = None
+    pipeline += '''# Retry the newest checkpoint if an earlier in-training upload failed.
+latest_checkpoints = sorted((RUN_DIR / "ckpts").glob("step_*.pt"))
+if latest_checkpoints:
+    latest_checkpoint = latest_checkpoints[-1]
+    upload_log = RUN_DIR / "hub_checkpoints.jsonl"
+    upload_events = ([json.loads(line) for line in upload_log.read_text().splitlines() if line.strip()]
+                     if upload_log.exists() else [])
+    already_uploaded = any(event.get("status") == "uploaded" and
+                           event.get("checkpoint") == latest_checkpoint.name
+                           for event in upload_events)
+    if not already_uploaded:
+        from hub import upload_training_checkpoint
+        try:
+            receipt = upload_training_checkpoint(hub_api, REPO_ID, latest_checkpoint, RUN_NAME)
+        except Exception as error:
+            print("WARNING: latest checkpoint remains only on Volume; rerun pipeline to retry:", error)
+        else:
+            receipt.update(status="uploaded", attempts=1)
+            with upload_log.open("a") as stream:
+                stream.write(json.dumps(receipt) + "\\n")
+            print("Latest Hub checkpoint verified:", receipt["url"])
+
+MODEL_URL = None
 EXPORT_DIR = VOLUME_ROOT / "hub_exports" / RUN_NAME
 if FINAL_CHECKPOINT.exists():
     subprocess.run([sys.executable, "evaluation.py", "--checkpoint", str(FINAL_CHECKPOINT),
@@ -169,9 +202,10 @@ else:
     replacements["download-note"] = cell("markdown", """
         ## Inference / TensorBoard
 
-        Hugging Face nhận final EMA `model.safetensors`, config, inference source,
-        best EMA validation weights, FID protocol/results, samples và diagnostics.
-        Optimizer checkpoints ở lại Volume. Download repo bằng snapshot_download
+        Hugging Face nhận checkpoint resume định kỳ trong
+        `training-checkpoints/<RUN_NAME>/`, rồi final EMA `model.safetensors`, config,
+        inference source, best EMA validation weights, FID, samples và diagnostics.
+        Download repo bằng snapshot_download
         rồi cài requirements.txt. Dùng `sample.py --model-dir ... --nfe 1` hoặc
         `--nfe 5`; `--weights best_validation.safetensors` chọn best snapshot.
         TensorBoard: `tensorboard --logdir /path/to/download/tensorboard`.

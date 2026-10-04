@@ -1,5 +1,6 @@
 """Export completed Trace-iMF runs and upload a loadable model bundle to the Hub."""
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -21,6 +22,35 @@ def prepare_repository(repo_id, token, private=True):
         if info.private != private:
             raise ValueError("Existing repo visibility differs from HF_PRIVATE; set HF_PRIVATE to match")
     return api
+
+
+def upload_training_checkpoint(api, repo_id, checkpoint_path, run_name):
+    """Upload one full resume checkpoint and verify it at the returned commit."""
+    checkpoint_path = Path(checkpoint_path).resolve()
+    if not checkpoint_path.is_file() or not re.fullmatch(r"step_\d{7}\.pt", checkpoint_path.name):
+        raise ValueError("Training checkpoint must be an existing step_XXXXXXX.pt file")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_name):
+        raise ValueError("Run name may contain only letters, digits, underscores, and hyphens")
+    path_in_repo = f"training-checkpoints/{run_name}/{checkpoint_path.name}"
+    commit = api.upload_file(
+        repo_id=repo_id,
+        repo_type="model",
+        path_or_fileobj=str(checkpoint_path),
+        path_in_repo=path_in_repo,
+        commit_message=f"Backup training checkpoint {run_name} {checkpoint_path.stem}",
+    )
+    present = set(api.list_repo_files(repo_id=repo_id, repo_type="model", revision=commit.oid))
+    if path_in_repo not in present:
+        raise RuntimeError(f"Hub commit is missing uploaded checkpoint: {path_in_repo}")
+    return {
+        "repo_id": repo_id,
+        "run_name": run_name,
+        "checkpoint": checkpoint_path.name,
+        "step": int(checkpoint_path.stem.removeprefix("step_")),
+        "revision": commit.oid,
+        "path_in_repo": path_in_repo,
+        "url": f"https://huggingface.co/{repo_id}/blob/{commit.oid}/{path_in_repo}",
+    }
 
 
 def export_model(checkpoint_path, output_dir, source_dir=None):
@@ -77,7 +107,8 @@ def export_model(checkpoint_path, output_dir, source_dir=None):
             shutil.copyfile(sample_path, output_dir / f"sample_grid_nfe{nfe}.png")
     if (run_dir / "source_manifest.json").exists():
         shutil.copyfile(run_dir / "source_manifest.json", output_dir / "source_manifest.json")
-    for name in ("validation.jsonl", "samples.jsonl", "best_validation.json", "best_validation.safetensors", "fid.json"):
+    for name in ("validation.jsonl", "samples.jsonl", "hub_checkpoints.jsonl",
+                 "best_validation.json", "best_validation.safetensors", "fid.json"):
         if (run_dir / name).is_file():
             shutil.copyfile(run_dir / name, output_dir / name)
     for name in ("diagnostics", "tensorboard"):
@@ -114,7 +145,9 @@ python sample.py --model-dir . --nfe 5 --output samples_5nfe.png
 
 config.json describes architecture/objective; training_config.json records the
 effective batch, accumulation, LR schedule, clipping and EMA decay.
-Optimizer/EMA/RNG resume checkpoints stay on the Modal Volume.
+Full optimizer/EMA/RNG resume checkpoints remain on the Modal Volume and, when
+the Modal notebook backup option is enabled, are also stored under
+training-checkpoints/<run-name>/ in this Hub repository.
 best_validation.safetensors contains the selected EMA validation snapshot;
 its step and fixed held-out losses are recorded in best_validation.json.
 Diagnostics include gradient RMS, actual optimizer updates, losses by K,
@@ -170,8 +203,9 @@ python /path/to/download/sample.py --model-dir /path/to/download --output sample
 For a private repository, provide HF_TOKEN in your environment before download.
 `model.safetensors` includes model weights and fixed positional buffers.
 `config.json` describes the architecture; `training_config.json` records the
-training hyperparameters. Optimizer checkpoints remain on the Modal Volume.
-They are not included in this inference bundle.
+training hyperparameters. Optimizer checkpoints are not included in this
+inference bundle; the Modal notebook can back them up separately under
+training-checkpoints/<run-name>/ in the same Hub repository.
 
 When available, diagnostics/ contains dashboards, gradient heatmaps, runtime
 plots, CSV and a convergence report. TensorBoard events are in tensorboard/.
@@ -200,6 +234,7 @@ def upload_model(api, repo_id, folder):
         allow_patterns=["model.safetensors", "config.json", "README.md", "sample.py",
             "trace_imf.py", "multi_trace_imf.py", "objectives.py", "models/*.py", "third_party/*", "LICENSE", "requirements.txt",
             "training_config.json", "training_metrics.json", "training_log.jsonl",
+            "hub_checkpoints.jsonl",
             "sample_grid*.png", "source_manifest.json", "validation.jsonl", "samples.jsonl",
             "best_validation.json", "best_validation.safetensors", "fid.json", "diagnostics/*", "tensorboard/**"])
     required = {"model.safetensors", "config.json", "sample.py", "models/dit.py", "trace_imf.py"}
