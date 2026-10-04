@@ -26,7 +26,7 @@ def prepare_repository(repo_id, token, private=True):
 def export_model(checkpoint_path, output_dir, source_dir=None):
     """Export a trusted LOCAL trainer checkpoint; require a completed real-data run."""
     from safetensors.torch import load_file, save_file
-    from models.dit import TraceDiT
+    from models import build_backbone
 
     checkpoint_path = Path(checkpoint_path).resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -39,20 +39,24 @@ def export_model(checkpoint_path, output_dir, source_dir=None):
     output_dir = Path(output_dir).resolve()
     run_dir = checkpoint_path.parent.parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    weights = {name: tensor.detach().cpu().contiguous() for name, tensor in checkpoint["model"].items()}
+    source = "ema" if checkpoint.get("ema") is not None else "model"
+    weights = {name: tensor.detach().cpu().contiguous() for name, tensor in checkpoint[source].items()}
     save_file(weights, str(output_dir / "model.safetensors"), metadata={"format": "pt"})
-    model = TraceDiT(**cfg["model"])
+    model = build_backbone(cfg)
     model.load_state_dict(load_file(str(output_dir / "model.safetensors")), strict=True)
     count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if count != checkpoint["trainable_parameters"]:
         raise ValueError("Checkpoint parameter count does not match the exported architecture")
-    model_config = {"architecture": "TraceDiT", "model": cfg["model"],
-        "trace_imf": cfg["trace_imf"], "dataset": cfg["dataset"],
+    objective = cfg.get("objective", "trace_imf")
+    model_config = {"architecture": cfg.get("architecture", "TraceDiT"), "model": cfg["model"],
+        "objective": objective, objective: cfg[objective], "dataset": cfg["dataset"],
+        "weights_source": source, "max_nfe": cfg.get("multi_trace_imf", {}).get("max_nfe", 1),
         "training_steps": checkpoint["step"], "trainable_parameters": count,
         "pixel_range": [0, 1], "sampling_steps": 1}
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
     (output_dir / "training_config.json").write_text(json.dumps(cfg, indent=2))
-    for name in ("models/dit.py", "models/__init__.py", "trace_imf.py", "sample.py",
+    for name in ("models/dit.py", "models/unet.py", "models/__init__.py", "trace_imf.py",
+                 "multi_trace_imf.py", "objectives.py", "sample.py",
                  "LICENSE", "third_party/MeanFlow.LICENSE", "third_party/README.md"):
         destination = output_dir / name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -67,9 +71,13 @@ def export_model(checkpoint_path, output_dir, source_dir=None):
     sample_path = run_dir / "images" / f"step_{checkpoint['step']:07d}.png"
     if sample_path.exists():
         shutil.copyfile(sample_path, output_dir / "sample_grid.png")
+    for nfe in range(2, model_config["max_nfe"] + 1):
+        sample_path = run_dir / "images" / f"step_{checkpoint['step']:07d}_nfe{nfe}.png"
+        if sample_path.exists():
+            shutil.copyfile(sample_path, output_dir / f"sample_grid_nfe{nfe}.png")
     if (run_dir / "source_manifest.json").exists():
         shutil.copyfile(run_dir / "source_manifest.json", output_dir / "source_manifest.json")
-    for name in ("validation.jsonl", "samples.jsonl", "best_validation.json", "best_validation.safetensors"):
+    for name in ("validation.jsonl", "samples.jsonl", "best_validation.json", "best_validation.safetensors", "fid.json"):
         if (run_dir / name).is_file():
             shutil.copyfile(run_dir / name, output_dir / name)
     for name in ("diagnostics", "tensorboard"):
@@ -80,6 +88,50 @@ def export_model(checkpoint_path, output_dir, source_dir=None):
 
 
 def model_card(cfg):
+    if cfg.get("objective") == "multi_trace_imf":
+        return f'''---
+library_name: pytorch
+license: mit
+tags: [meanflow, multi-trace, image-generation, class-conditional, cifar10]
+---
+
+# Multi-Trace U-Net — {cfg['trainable_parameters']:,} parameters
+
+U-Net adapted from the user-provided Untitled0.ipynb and widened to approximately
+22M parameters. Trained for {cfg['training_steps']:,} optimizer updates on CIFAR-10.
+Training samples K uniformly from 1..{cfg['max_nfe']} and a grid interval j/K;
+the same u head fits the interval and diagonal, with a detached directional JVP.
+Default inference weights are **{cfg['weights_source']}**. Model input/output pixels
+are 32x32 RGB; sampling maps the final [-1,1] image into [0,1].
+
+This is a custom PyTorch model. Download with huggingface_hub.snapshot_download,
+install the included requirements.txt, then run:
+
+```bash
+python sample.py --model-dir . --nfe 1 --output samples_1nfe.png
+python sample.py --model-dir . --nfe 5 --output samples_5nfe.png
+```
+
+config.json describes architecture/objective; training_config.json records the
+effective batch, accumulation, LR schedule, clipping and EMA decay.
+Optimizer/EMA/RNG resume checkpoints stay on the Modal Volume.
+best_validation.safetensors contains the selected EMA validation snapshot;
+its step and fixed held-out losses are recorded in best_validation.json.
+Diagnostics include gradient RMS, actual optimizer updates, losses by K,
+clipping frequency, samples, throughput, ETA and TensorBoard events.
+Plateau flags are heuristics, not proof of convergence or image quality.
+
+When present, fid.json reports pytorch-fid pool3 FID against 50,000 unaugmented
+CIFAR-10 training images, with the generated sample count and each NFE explicitly
+recorded. This protocol differs from the reference notebook's ImageNet-feature
+FID; the values must not be compared directly. No quality claim is made here.
+The test split was used as fixed validation during training.
+
+Labels: airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck.
+The U-Net and interval schedule follow the user-provided notebook; repository
+training flow and DiT baseline are adapted from haidog-yaqub/MeanFlow (MIT).
+See third_party/ for attribution.
+'''
     return f'''---
 library_name: pytorch
 license: mit
@@ -146,11 +198,13 @@ def upload_model(api, repo_id, folder):
     commit = api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=str(folder),
         commit_message="Upload completed Trace-iMF training run",
         allow_patterns=["model.safetensors", "config.json", "README.md", "sample.py",
-            "trace_imf.py", "models/*.py", "third_party/*", "LICENSE", "requirements.txt",
+            "trace_imf.py", "multi_trace_imf.py", "objectives.py", "models/*.py", "third_party/*", "LICENSE", "requirements.txt",
             "training_config.json", "training_metrics.json", "training_log.jsonl",
-            "sample_grid.png", "source_manifest.json", "validation.jsonl", "samples.jsonl",
-            "best_validation.json", "best_validation.safetensors", "diagnostics/*", "tensorboard/**"])
+            "sample_grid*.png", "source_manifest.json", "validation.jsonl", "samples.jsonl",
+            "best_validation.json", "best_validation.safetensors", "fid.json", "diagnostics/*", "tensorboard/**"])
     required = {"model.safetensors", "config.json", "sample.py", "models/dit.py", "trace_imf.py"}
+    if (Path(folder) / "config.json").exists():
+        required |= {"models/__init__.py", "models/unet.py", "objectives.py", "multi_trace_imf.py"}
     present = set(api.list_repo_files(repo_id=repo_id, repo_type="model", revision=commit.oid))
     if not required <= present:
         raise RuntimeError(f"Hub commit is missing required files: {sorted(required - present)}")

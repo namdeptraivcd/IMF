@@ -16,7 +16,7 @@ def cell(kind, source, name):
     return result
 
 
-def build():
+def make_notebook():
     cells = [cell("markdown", """
         # Trace-iMF 22M · Modal Notebook · diagnostics / resume / Hugging Face
 
@@ -306,10 +306,15 @@ def build():
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python", "version": "3.10"},
     }, "nbformat": 4, "nbformat_minor": 5}
+    return notebook
+
+
+def build():
+    notebook = make_notebook()
     destination = ROOT / "notebooks/trace_imf_modal.ipynb"
     destination.parent.mkdir(exist_ok=True)
     destination.write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + "\n")
-    print(f"Created {destination}: {len(cells)} cells, Git clone workflow")
+    print(f"Created {destination}: {len(notebook['cells'])} cells, Git clone workflow")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ def rollback_logs(run_dir, step):
 
 def group_name(name):
     parts = name.split(".")
-    return ".".join(parts[:2]) if parts[0] == "blocks" else parts[0]
+    return ".".join(parts[:2]) if parts[0] in ("blocks", "down_levels", "up_levels") else parts[0]
 
 
 def gradient_snapshot(model, scale=1.0):
@@ -80,6 +80,19 @@ def finish_gradient_snapshot(model, snapshot):
 @torch.no_grad()
 def evaluate(model, objective, loader, device, seed, max_batches):
     """Fixed held-out images, times and noise; do not consume the training RNG."""
+    if hasattr(objective, "max_nfe"):
+        # Same images, within-interval quantiles and noise for each K. Report
+        # the uniformly weighted K mean as well as each separate trace budget.
+        results = {}
+        for k in range(1, objective.max_nfe + 1):
+            results[k] = _evaluate_multi(model, objective, loader, device, seed, max_batches, k)
+        average = {name: sum(r[name] for r in results.values()) / len(results)
+                   for name in ("loss", "edge_loss", "diag_loss", "jvp_rms")}
+        average.update(examples=results[1]["examples"])
+        for k, result in results.items():
+            average.update({f"{name}_nfe_{k}": result[name]
+                            for name in ("loss", "edge_loss", "diag_loss", "jvp_rms")})
+        return average
     was_training = model.training
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -103,6 +116,32 @@ def evaluate(model, objective, loader, device, seed, max_batches):
     if not examples:
         raise ValueError("Validation loader produced no examples")
     return {key: value / examples for key, value in totals.items()} | {"examples": examples}
+
+
+@torch.no_grad()
+def _evaluate_multi(model, objective, loader, device, seed, max_batches, k):
+    was_training = model.training
+    model.eval()
+    generator = torch.Generator(device=device).manual_seed(seed)
+    totals = dict(loss=0.0, edge_loss=0.0, diag_loss=0.0, jvp_rms=0.0)
+    examples = 0
+    try:
+        for index, (images, labels) in enumerate(loader):
+            if index >= max_batches:
+                break
+            images, labels = images.to(device), labels.to(device)
+            r = torch.full((len(images),), (index % k) / k, device=device)
+            t = r + torch.rand(len(images), device=device, generator=generator) / k
+            noise = torch.randn(images.shape, device=device, generator=generator)
+            loss, metrics = objective.loss(model, images, labels, derivative_model=model, t=t, r=r, noise=noise)
+            for name, value in {"loss": loss, **metrics}.items():
+                totals[name] += float(value) * len(images)
+            examples += len(images)
+    finally:
+        model.train(was_training)
+    if not examples:
+        raise ValueError("Validation loader produced no examples")
+    return {name: value / examples for name, value in totals.items()} | {"examples": examples}
 
 
 def convergence_summary(train, validation, total_steps, window=5, plateau_fraction=0.01):
@@ -162,15 +201,16 @@ class TrainingMonitor:
             temporary.replace(path)
             (self.run_dir / "best_validation.json").write_text(json.dumps(record, indent=2))
 
-    def samples(self, step, images):
+    def samples(self, step, images, nfe=1):
         record = {"step": step, "pixel_mean": float(images.mean()),
+                  "nfe": nfe,
                   "pixel_std": float(images.std()),
                   "between_samples_std": float(images.std(dim=0).mean())}
         with (self.run_dir / "samples.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
-        self.scalars("samples", record)
+        self.scalars(f"samples_nfe_{nfe}", record)
         if self.writer:
-            self.writer.add_images("samples/fixed_noise", images, step)
+            self.writer.add_images(f"samples/fixed_noise_nfe_{nfe}", images, step)
 
     def scalars(self, phase, record):
         if not self.writer:
@@ -221,7 +261,7 @@ def render_dashboard(run_dir, total_steps):
 
     lines(axes[0], train, ["loss", "edge_loss", "diag_loss"])
     axes[0].set_title("Training losses (window means)")
-    lines(axes[1], validation, ["loss", "edge_loss", "diag_loss"])
+    lines(axes[1], validation, ["loss", "raw_loss", "edge_loss", "diag_loss"])
     axes[1].set_title("Held-out losses: fixed data, t and noise")
     lines(axes[2], train, ["grad_norm", "grad_norm_postclip"])
     axes[2].set_yscale("symlog", linthresh=1e-7)
@@ -243,13 +283,23 @@ def render_dashboard(run_dir, total_steps):
     axes[6].set_xlabel("optimizer step")
     if axes[6].lines:
         axes[6].legend(fontsize=6, ncol=2)
-    lines(axes[7], samples, ["pixel_std", "between_samples_std"])
-    axes[7].set_title("Fixed-noise sample spread (not a quality score)")
+    lines(axes[7], [r for r in samples if r.get("nfe", 1) == 1],
+          ["pixel_std", "between_samples_std"])
+    axes[7].set_title("1-NFE fixed-noise sample spread (not a quality score)")
     path = destination / "dashboard.png"
     temporary_plot = path.with_suffix(".png.tmp")
     fig.savefig(temporary_plot, dpi=120, format="png")
     temporary_plot.replace(path)
     plt.close(fig)
+    if validation and "loss_nfe_1" in validation[-1]:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4), constrained_layout=True)
+        keys = [f"loss_nfe_{k}" for k in range(1, 6)]
+        lines(axes[0], train, keys)
+        axes[0].set_title("Training loss by sampled K (unequal observation counts)")
+        lines(axes[1], validation, keys)
+        axes[1].set_title("Fixed EMA validation by K")
+        fig.savefig(destination / "multitrace.png", dpi=120)
+        plt.close(fig)
     diagnostic_rows = [r for r in train if r.get("gradient_groups")]
     if diagnostic_rows:
         groups = sorted({group for row in diagnostic_rows for group in row["gradient_groups"]})

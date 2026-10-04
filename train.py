@@ -6,14 +6,15 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from models.dit import TraceDiT
-from trace_imf import TraceIMF
+from models import build_backbone
+from objectives import build_objective
 
 
 def load_config(path):
@@ -24,18 +25,12 @@ def load_config(path):
 
 
 def build_model(cfg):
-    model = TraceDiT(**cfg["model"])
+    model = build_backbone(cfg)
     count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     target = cfg["parameter_target"]
     if abs(count - target) > target * cfg["parameter_tolerance"]:
         raise ValueError(f"Model has {count:,} trainable parameters; target is {target:,}")
     return model, count
-
-
-def build_objective(cfg):
-    return TraceIMF(channels=cfg["model"]["in_channels"],
-                    image_size=cfg["model"]["input_size"],
-                    num_classes=cfg["model"]["num_classes"], **cfg["trace_imf"])
 
 
 def smoke_test(model, cfg):
@@ -69,11 +64,21 @@ def run_training(model, count, cfg, args):
     from accelerate.utils import DistributedDataParallelKwargs, broadcast_object_list, set_seed
     from torchvision.utils import make_grid, save_image
     from tqdm import tqdm
-    from data import build_dataset, cycle
+    from data import build_dataset, cycle, ResidentCIFARBatcher
+    from ema import ModelEMA
     from monitoring import (TrainingMonitor, evaluate, finish_gradient_snapshot,
                             gradient_snapshot, rollback_logs)
 
     precision = cfg["mixed_precision"] if torch.cuda.is_available() else "no"
+    accumulation = cfg.get("gradient_accumulation_steps", 1)
+    if accumulation < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if cfg.get("allow_tf32") and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    if cfg.get("channels_last"):
+        model = model.to(memory_format=torch.channels_last)
     accelerator = Accelerator(cpu=not torch.cuda.is_available(), mixed_precision=precision, kwargs_handlers=[
         DistributedDataParallelKwargs(find_unused_parameters=False)])
     resume_path = getattr(args, "resume", None)
@@ -83,9 +88,12 @@ def run_training(model, count, cfg, args):
         # Resume only checkpoints produced by this trainer, including RNG state.
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         original = checkpoint["config"]
-        for key in ("model", "trace_imf", "n_steps", "lr", "warmup_steps", "min_lr_ratio",
-                    "weight_decay", "dataset", "image_size", "seed", "batch_size"):
-            if cfg[key] != original[key]:
+        for key in ("architecture", "objective", "model", "trace_imf", "multi_trace_imf",
+                    "n_steps", "lr", "warmup_steps", "min_lr_ratio", "weight_decay", "dataset",
+                    "image_size", "seed", "batch_size", "gradient_accumulation_steps", "ema_decay",
+                    "betas", "grad_clip", "preload_gpu", "mixed_precision", "channels_last", "allow_tf32"):
+            # JSON normalizes tuples to lists; compare their serialized values.
+            if json.dumps(cfg.get(key)) != json.dumps(original.get(key)):
                 raise ValueError(f"Resume config mismatch: {key}")
         if cfg.get("source_manifest") != original.get("source_manifest"):
             raise ValueError("Resume source snapshot differs from the checkpoint")
@@ -108,11 +116,17 @@ def run_training(model, count, cfg, args):
             dataset = build_dataset(cfg)
     if len(dataset) < cfg["batch_size"]:
         raise ValueError("Dataset is smaller than one batch with drop_last=True")
+    resident = cfg.get("preload_gpu", False) and accelerator.device.type == "cuda" and not args.fake_data
+    if resident and (cfg["dataset"] != "cifar10" or accelerator.num_processes != 1):
+        raise ValueError("GPU-resident CIFAR profile requires one GPU/process")
     loader = torch.utils.data.DataLoader(dataset, batch_size=cfg["batch_size"],
         shuffle=True, drop_last=True, num_workers=cfg["num_workers"],
         pin_memory=accelerator.device.type == "cuda")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                                 weight_decay=cfg["weight_decay"])
+    optimizer_options = dict(lr=cfg["lr"], weight_decay=cfg["weight_decay"],
+                             betas=tuple(cfg.get("betas", (0.9, 0.999))))
+    if cfg.get("fused_optimizer") and accelerator.device.type == "cuda":
+        optimizer_options["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_options)
 
     def lr_lambda(step):
         warmup = min(cfg["warmup_steps"], max(cfg["n_steps"] - 1, 0))
@@ -126,6 +140,9 @@ def run_training(model, count, cfg, args):
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
     # Scheduler uses optimizer-step units, independent of distributed world size.
+    ema = ModelEMA(model, cfg["ema_decay"]) if cfg.get("ema_decay") else None
+    if ema:
+        ema.model.to(accelerator.device)
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
     if checkpoint is not None and checkpoint.get("scaler") and accelerator.scaler is not None:
         accelerator.scaler.load_state_dict(checkpoint["scaler"])
@@ -150,7 +167,9 @@ def run_training(model, count, cfg, args):
                 "world_size": accelerator.num_processes, "mixed_precision": precision,
                 "synthetic_data": args.fake_data, "torch_version": str(torch.__version__),
                 "cuda_version": torch.version.cuda, "device": str(accelerator.device),
-                "global_batch_size": cfg["batch_size"] * accelerator.num_processes,
+                "global_batch_size": cfg["batch_size"] * accumulation * accelerator.num_processes,
+                "micro_batch_size": cfg["batch_size"], "gradient_accumulation_steps": accumulation,
+                "ema_decay": cfg.get("ema_decay"),
                 "gpu_name": torch.cuda.get_device_name() if accelerator.device.type == "cuda" else None}) + "\n")
         else:
             if not (run_dir / "config.json").exists():
@@ -159,8 +178,26 @@ def run_training(model, count, cfg, args):
             with (run_dir / "train.jsonl").open("a") as stream:
                 stream.write(json.dumps({"resume_from_step": start_step}) + "\n")
     accelerator.wait_for_everyone()
-    loader = cycle(loader)
+    loader = (ResidentCIFARBatcher(dataset, cfg["batch_size"], accelerator.device,
+                                  checkpoint.get("batcher") if checkpoint else None)
+              if resident else cycle(loader))
     bare_model = accelerator.unwrap_model(model)
+    if ema:
+        if checkpoint is not None:
+            if "ema" not in checkpoint or checkpoint["ema"] is None:
+                raise ValueError("Resume checkpoint is missing EMA state")
+            ema.model.load_state_dict(checkpoint["ema"], strict=True)
+            ema.updates = checkpoint["ema_updates"]
+    evaluation_model = ema.model if ema else bare_model
+    def run_validation():
+        with accelerator.autocast():
+            values = evaluate(evaluation_model, objective, val_loader, accelerator.device,
+                              cfg["seed"] + 1001, monitor_cfg.get("validation_batches", 4))
+            if ema and monitor_cfg.get("validate_raw", False):
+                raw = evaluate(bare_model, objective, val_loader, accelerator.device,
+                               cfg["seed"] + 1001, monitor_cfg.get("validation_batches", 4))
+                values.update({f"raw_{name}": value for name, value in raw.items() if name != "examples"})
+            return values
     if checkpoint is not None and "rng_states" in checkpoint:
         rng = checkpoint["rng_states"][accelerator.process_index]
         torch.set_rng_state(rng["torch"])
@@ -180,6 +217,8 @@ def run_training(model, count, cfg, args):
             speed = (step - start_step) / max(elapsed, 1e-9)
             state = {"step": step, "total_steps": cfg["n_steps"], "phase": phase,
                      "elapsed_seconds": elapsed, "steps_per_second": speed,
+                     "images_seen": step * cfg["batch_size"] * accumulation * accelerator.num_processes,
+                     "images_per_second": speed * cfg["batch_size"] * accumulation * accelerator.num_processes,
                      "eta_seconds": (cfg["n_steps"] - step) / speed if speed > 0 else None}
             temporary = run_dir / "progress.json.tmp"
             temporary.write_text(json.dumps(state))
@@ -205,14 +244,15 @@ def run_training(model, count, cfg, args):
             cfg["batch_size"] * monitor_cfg.get("validation_batches", 4)]
         val_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(val_dataset, indices.tolist()),
             batch_size=cfg["batch_size"], shuffle=False, num_workers=0, generator=generator)
-        initial_validation = evaluate(bare_model, objective, val_loader, accelerator.device,
-            cfg["seed"] + 1001, monitor_cfg.get("validation_batches", 4))
-        monitor.validation({"step": start_step, **initial_validation}, bare_model)
+        initial_validation = run_validation()
+        monitor.validation({"step": start_step, "weights_source": "ema" if ema else "raw",
+                            **initial_validation}, evaluation_model)
         monitor.render()
     accelerator.wait_for_everyone()
     model.train()
     totals = torch.zeros(7, device=accelerator.device)
     logged_steps = 0
+    nfe_totals = {}
     optimizer.zero_grad(set_to_none=True)
     progress = tqdm(range(start_step + 1, stop_step + 1), initial=start_step,
                     total=cfg["n_steps"], disable=not accelerator.is_main_process,
@@ -220,9 +260,25 @@ def run_training(model, count, cfg, args):
 
 
     for step in progress:
-        x, labels = next(loader)
-        loss, metrics = objective.loss(model, x, labels, derivative_model=bare_model)
-        accelerator.backward(loss)
+        interval = objective.draw_interval(accelerator.device) if hasattr(objective, "draw_interval") else None
+        batch_totals = torch.zeros(4, device=accelerator.device)
+        for micro_index in range(accumulation):
+            # Average gradients over the effective image batch. DDP communicates
+            # once, after the last microbatch; optimizer/scheduler/EMA update once.
+            context = accelerator.no_sync(model) if micro_index < accumulation - 1 else nullcontext()
+            with context:
+                x, labels = next(loader)
+                extra = {"interval": interval} if interval is not None else {}
+                micro_loss, micro_metrics = objective.loss(model, x, labels, derivative_model=bare_model, **extra)
+                accelerator.backward(micro_loss / accumulation)
+                batch_totals += torch.stack((micro_loss.detach(), micro_metrics["edge_loss"],
+                                             micro_metrics["diag_loss"], micro_metrics["jvp_rms"])) / accumulation
+        loss = batch_totals[0]
+        metrics = dict(zip(("edge_loss", "diag_loss", "jvp_rms"), batch_totals[1:]))
+        if interval is not None:
+            values = nfe_totals.setdefault(interval[0], [0.0, 0])
+            values[0] += float(loss)
+            values[1] += 1
         log_now = step % cfg["log_step"] == 0 or step == stop_step or step == start_step + 1
         snapshot = None
         if monitor and log_now:
@@ -242,6 +298,8 @@ def run_training(model, count, cfg, args):
         optimizer.step()
         if not accelerator.optimizer_step_was_skipped:
             scheduler.step()
+            if ema:
+                ema.update(bare_model)
         gradient_groups = finish_gradient_snapshot(bare_model, snapshot) if snapshot else None
         del snapshot
         optimizer.zero_grad(set_to_none=True)
@@ -257,8 +315,15 @@ def run_training(model, count, cfg, args):
                 record = dict(step=step, lr=lr_used, window_steps=logged_steps,
                     elapsed_seconds=timing["elapsed_seconds"], steps_per_second=timing["steps_per_second"],
                     eta_seconds=timing["eta_seconds"],
+                    images_seen=timing["images_seen"], images_per_second=timing["images_per_second"],
+                    effective_batch_size=cfg["batch_size"] * accumulation * accelerator.num_processes,
                     **dict(zip(("loss", "edge_loss", "diag_loss", "jvp_rms", "grad_norm",
                                 "grad_norm_postclip", "clip_fraction"), means)))
+                if ema:
+                    record.update(ema_updates=ema.updates, ema_decay=ema.decay)
+                for nfe, (value, observations) in nfe_totals.items():
+                    record[f"loss_nfe_{nfe}"] = value / observations
+                    record[f"updates_nfe_{nfe}"] = observations
                 if accelerator.device.type == "cuda":
                     record.update(gpu_allocated_gb=torch.cuda.memory_allocated() / 2**30,
                                   gpu_reserved_gb=torch.cuda.memory_reserved() / 2**30,
@@ -276,13 +341,13 @@ def run_training(model, count, cfg, args):
                                      lr=f"{lr_used:.2g}", refresh=False)
             totals.zero_()
             logged_steps = 0
+            nfe_totals.clear()
         validation_now = monitoring_enabled and (step % monitor_cfg.get("validation_every", 1000) == 0 or step == stop_step)
         if validation_now:
             if monitor:
                 save_progress(step, "validation")
-                validation = evaluate(bare_model, objective, val_loader, accelerator.device,
-                    cfg["seed"] + 1001, monitor_cfg.get("validation_batches", 4))
-                monitor.validation({"step": step, **validation}, bare_model)
+                validation = run_validation()
+                monitor.validation({"step": step, "weights_source": "ema" if ema else "raw", **validation}, evaluation_model)
             accelerator.wait_for_everyone()
         if step % cfg["sample_step"] == 0 or step == stop_step:
             if accelerator.is_main_process:
@@ -293,12 +358,16 @@ def run_training(model, count, cfg, args):
                 sample_generator = torch.Generator(device=accelerator.device).manual_seed(cfg["seed"] + 2000)
                 fixed_noise = torch.randn(n_samples, objective.channels, objective.image_size,
                     objective.image_size, device=accelerator.device, generator=sample_generator)
-                samples = objective.sample(bare_model, labels=labels,
-                                           device=accelerator.device, noise=fixed_noise)
-                save_image(make_grid(samples, nrow=cfg["sample_nrow"]),
-                    run_dir / "images" / f"step_{step:07d}.png")
-                if monitor:
-                    monitor.samples(step, samples)
+                for nfe in range(1, getattr(objective, "max_nfe", 1) + 1):
+                    extra = {"nfe": nfe} if hasattr(objective, "max_nfe") else {}
+                    with accelerator.autocast():
+                        samples = objective.sample(evaluation_model, labels=labels,
+                            device=accelerator.device, noise=fixed_noise, **extra)
+                    suffix = "" if nfe == 1 else f"_nfe{nfe}"
+                    save_image(make_grid(samples, nrow=cfg["sample_nrow"]),
+                        run_dir / "images" / f"step_{step:07d}{suffix}.png")
+                    if monitor:
+                        monitor.samples(step, samples, nfe=nfe)
             accelerator.wait_for_everyone()
         if monitor and (step % monitor_cfg.get("plot_every", 200) == 0 or validation_now or step == stop_step):
             save_progress(step, "plotting")
@@ -316,6 +385,9 @@ def run_training(model, count, cfg, args):
                 checkpoint_path = run_dir / "ckpts" / f"step_{step:07d}.pt"
                 temporary_path = checkpoint_path.with_suffix(".pt.tmp")
                 accelerator.save({"model": bare_model.state_dict(), "step": step,
+                    "ema": ema.model.state_dict() if ema else None,
+                    "ema_updates": ema.updates if ema else 0,
+                    "batcher": loader.state_dict() if resident else None,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "config": cfg, "trainable_parameters": count,
                     "synthetic_data": args.fake_data, "world_size": accelerator.num_processes,

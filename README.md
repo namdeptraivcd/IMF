@@ -1,5 +1,28 @@
 # IMF - Trace-iMF, khoảng 22M tham số
 
+Profile mới tham chiếu notebook **U-Net Multi-Trace** của người dùng:
+[SCALING.md](SCALING.md) có bảng so sánh config và công thức scale theo image budget.
+Backbone **22.002.655 tham số**, base channels84, cond356; K=1..5, BF16, AdamW
+betas(0.9,0.99), clipping1.0, effective batch512 (micro128 × accumulation4),
+100k optimizer updates, warmup5k, EMA .9999. LR1e-4→1e-5 giữ theo bản tham chiếu.
+
+Notebook mới: [notebooks/multitrace_imf_modal.ipynb](notebooks/multitrace_imf_modal.ipynb).
+Clone nhánh `codex/modal-training`; cần RUN_NAME mới, Volume và HF_TOKEN Secret.
+Mặc định pilot1000 updates có resume/ETA/gradient/raw+EMA validation; đổi
+`STOP_AFTER_UPDATES=None` để train hết schedule rồi chạy FID1..5 NFE và upload
+final EMA model lên Hugging Face. FID dùng pytorch-fid, khác protocol FID trong
+notebook nguồn nên không so trực tiếp. Local tests không xác nhận CUDA memory,
+thời gian hoàn tất hay chất lượng model trên Modal.
+
+```bash
+python train.py --config configs/multitrace_cifar10_22m.py --check-model
+python train.py --config configs/multitrace_cifar10_22m.py --smoke-test
+python tools/build_multitrace_notebook.py
+```
+
+Phần dưới mô tả baseline **DiT hai trace** cũ; profile U-Net mới dùng config,
+objective, EMA và sampling 1..5 NFE được mô tả trong SCALING.md.
+
 Triển khai PyTorch theo idea Trace-iMF của người dùng, kế thừa DiT và training
 flow từ `../backbone_IMF`. Đọc [REPO_PLAN.md](REPO_PLAN.md) để xem khảo sát repo,
 công thức loss, khác biệt với implementation nguồn và phạm vi lý thuyết.

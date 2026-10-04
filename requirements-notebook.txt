@@ -7,3 +7,4 @@ tqdm>=4.65
 matplotlib>=3.7
 tensorboard>=2.14
 ipywidgets>=8
+pytorch-fid==0.3.0

@@ -12,7 +12,8 @@ class TraceIMF:
         self.num_classes = num_classes
         self.lambda_diag = lambda_diag
 
-    def loss(self, model, x, labels=None, *, derivative_model=None, t=None, noise=None):
+    def loss(self, model, x, labels=None, *, derivative_model=None, t=None, noise=None,
+             r=None, generator=None):
         """x is raw image data in [0,1]. Optional t/noise permit exact checks.
 
         Use the unwrapped model for JVP under Accelerate/DDP. The single joint
@@ -20,8 +21,8 @@ class TraceIMF:
         """
         b = x.shape[0]
         x = x.float() * 2 - 1
-        t = torch.rand(b, device=x.device) if t is None else t.to(x.device).float()
-        noise = torch.randn_like(x) if noise is None else noise.to(x.device).float()
+        t = torch.rand(b, device=x.device, generator=generator) if t is None else t.to(x.device).float()
+        noise = torch.randn(x.shape, device=x.device, generator=generator) if noise is None else noise.to(x.device).float()
         if t.shape != (b,) or noise.shape != x.shape:
             raise ValueError("Expected t with shape (B,) and noise with the image shape")
         if self.num_classes is not None and labels is None:
@@ -31,7 +32,11 @@ class TraceIMF:
         t_image = t[:, None, None, None]
         z = (1 - t_image) * x + t_image * noise
         target = noise - x
-        r = torch.zeros_like(t)
+        r = torch.zeros_like(t) if r is None else r.to(x.device).float()
+        if r.shape != t.shape or (r < 0).any() or (t > 1).any() or (r > t).any():
+            raise ValueError("Require 0 <= r <= t <= 1, with r and t shaped (B,)")
+        if getattr(self, "channels_last", False):
+            z = z.contiguous(memory_format=torch.channels_last)
 
         # Both branches use the SAME u head, evaluated at r=0 and r=t.
         pair_labels = None if labels is None else torch.cat((labels, labels))
@@ -43,7 +48,9 @@ class TraceIMF:
 
         # FP32 JVP: native attention supports forward AD; SDPA is used only in
         # the grad-enabled forward. No parameter gradient through the JVP.
-        with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
+        use_bf16 = getattr(self, "jvp_precision", "fp32") == "bf16" and x.device.type == "cuda"
+        with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=use_bf16,
+                                           dtype=torch.bfloat16):
             def edge_fn(z_value, t_value, r_value):
                 # Accelerate may autocast the instance's forward even after
                 # unwrap_model. The class forward bypasses that AMP wrapper
@@ -56,7 +63,7 @@ class TraceIMF:
                 (diagonal.detach().float(), torch.ones_like(t), torch.zeros_like(r)),
             )
 
-        compound = edge.float() + t_image * derivative.detach()
+        compound = edge.float() + (t - r)[:, None, None, None] * derivative.detach().float()
         edge_loss = F.mse_loss(compound, target)
         diag_loss = F.mse_loss(diagonal.float(), target)
         loss = edge_loss + self.lambda_diag * diag_loss
